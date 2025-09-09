@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	jwt "github.com/golang-jwt/jwt/v5"
 )
 
 type ServerInfo struct {
@@ -25,13 +32,15 @@ type ServerInfo struct {
 	LastSeen       time.Time `json:"lastSeen"`
 }
 
-type HeartbeatRequest struct {
-	ID             string `json:"id"`
+type HeartbeatClaims struct {
+	jwt.RegisteredClaims
+}
+
+type HeartbeatBody struct {
+	Name           string `json:"name,omitempty"`
 	Address        string `json:"address,omitempty"`
 	Port           int    `json:"port"`
-	Timestamp      int64  `json:"timestamp"`
-	Nonce          string `json:"nonce"`
-	Name           string `json:"name,omitempty"`
+	APIPort        int    `json:"apiPort,omitempty"`
 	CurrentPlayers int    `json:"currentPlayers,omitempty"`
 	MaxPlayers     int    `json:"maxPlayers,omitempty"`
 }
@@ -117,59 +126,113 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var hb HeartbeatRequest
-		dec := json.NewDecoder(r.Body)
-		if err := dec.Decode(&hb); err != nil {
+
+		var body HeartbeatBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+
 		senderIP := clientIP(r)
 		if senderIP == nil {
 			http.Error(w, "could not determine sender IP", http.StatusBadRequest)
 			return
 		}
-		hb.Address = senderIP.String()
-		if hb.Port == 0 {
+
+		tokenString := ""
+		if ah := r.Header.Get("Authorization"); ah != "" {
+			parts := strings.SplitN(ah, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+				tokenString = strings.TrimSpace(parts[1])
+			}
+		}
+		if tokenString == "" {
+			http.Error(w, "missing JWT bearer token", http.StatusBadRequest)
+			return
+		}
+
+		announcedIP := strings.TrimSpace(body.Address)
+		if announcedIP == "" {
+			announcedIP = senderIP.String()
+		}
+		body.Address = announcedIP
+		keyFunc := func(t *jwt.Token) (any, error) {
+			// Restrict algorithms to RSA variants
+			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
+			}
+			// Extract claims (unverified at this stage)
+			if c, ok := t.Claims.(*HeartbeatClaims); ok {
+				issuer := c.RegisteredClaims.Issuer
+				if issuer == "" {
+					issuer = "http://" + announcedIP + ":" + strconv.Itoa(body.APIPort)
+				}
+				// Resolve public key using issuer and the kid from the JWT
+				var kid string
+				if hv, ok := t.Header["kid"]; ok {
+					if s, ok := hv.(string); ok {
+						kid = s
+					}
+				}
+				pk, err := resolvePublicKey(issuer, kid)
+				if err != nil {
+					return nil, err
+				}
+				return pk, nil
+			}
+			return nil, errors.New("invalid claims type")
+		}
+
+		token, err := jwt.ParseWithClaims(tokenString, &HeartbeatClaims{}, keyFunc, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512"}))
+		if err != nil || !token.Valid {
+			http.Error(w, "invalid token: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+		claims, ok := token.Claims.(*HeartbeatClaims)
+		if !ok {
+			http.Error(w, "invalid claims", http.StatusUnauthorized)
+			return
+		}
+
+		if body.Port == 0 {
 			http.Error(w, "port is required", http.StatusBadRequest)
 			return
 		}
-		if hb.Address == "" {
-			http.Error(w, "address is required and could not be inferred", http.StatusBadRequest)
+		serverId := claims.RegisteredClaims.Subject
+		if serverId == "" {
+			http.Error(w, "subject is required", http.StatusBadRequest)
 			return
 		}
-		lookupID := hb.ID
-		if lookupID == "" {
-			lookupID = hb.Address + ":" + strconv.Itoa(hb.Port)
-		}
 
-		if existing := reg.Get(lookupID); existing != nil {
-			if existing.Address != hb.Address || existing.Port != hb.Port {
+		if existing := reg.Get(serverId); existing != nil {
+			if existing.Address != body.Address || existing.Port != body.Port {
+				// TODO for verified servers, this will be allowed
 				http.Error(w, "address or port changed for existing ID", http.StatusBadRequest)
 				return
 			}
-			reg.Touch(lookupID)
+			reg.Touch(serverId)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
 		}
 
-		if hb.CurrentPlayers < 0 || hb.MaxPlayers < 0 || hb.CurrentPlayers > hb.MaxPlayers {
+		if body.CurrentPlayers < 0 || body.MaxPlayers < 0 {
 			http.Error(w, "invalid players data", http.StatusBadRequest)
 			return
 		}
-		if len(hb.Name) > 200 {
+		if len(body.Name) > 200 {
 			http.Error(w, "name too long", http.StatusBadRequest)
 			return
 		}
 
 		s := ServerInfo{
-			ID:             hb.ID,
-			Name:           hb.Name,
-			Address:        hb.Address,
-			Port:           hb.Port,
-			CurrentPlayers: hb.CurrentPlayers,
-			MaxPlayers:     hb.MaxPlayers,
+			ID:             serverId,
+			Name:           body.Name,
+			Address:        body.Address,
+			Port:           body.Port,
+			CurrentPlayers: body.CurrentPlayers,
+			MaxPlayers:     body.MaxPlayers,
 		}
 		reg.Upsert(s)
 		w.Header().Set("Content-Type", "application/json")
@@ -403,4 +466,92 @@ func clientIP(r *http.Request) net.IP {
 		}
 	}
 	return rip
+}
+
+func resolvePublicKey(issuer, kid string) (*rsa.PublicKey, error) {
+	// TODO in the future, verified servers will provide a known registered issuer id under which we can lookup the stored public key instead of just trusting the announced ip
+	pk, err := fetchPublicKeyHTTP(issuer, kid)
+	if err != nil {
+		return nil, err
+	}
+	return pk, nil
+}
+
+func fetchPublicKeyHTTP(issuer string, kid string) (*rsa.PublicKey, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	jwksURL := fmt.Sprintf("%s/heartbeat/jwks", issuer)
+	if pk, err := fetchJWKS(client, jwksURL, kid); err == nil && pk != nil {
+		return pk, nil
+	}
+	return nil, errors.New("failed to fetch public key")
+}
+
+type jwkKey struct {
+	Kty string `json:"kty"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+	Use string `json:"use,omitempty"`
+	Alg string `json:"alg,omitempty"`
+	Kid string `json:"kid,omitempty"`
+}
+
+type jwksDoc struct {
+	Keys []jwkKey `json:"keys"`
+}
+
+func fetchJWKS(client *http.Client, url string, kid string) (*rsa.PublicKey, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("jwks status %d", resp.StatusCode)
+	}
+	var doc jwksDoc
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Keys) == 0 {
+		return nil, errors.New("jwks contains no keys")
+	}
+	// Prefer matching kid when provided
+	if kid != "" {
+		for _, k := range doc.Keys {
+			if strings.EqualFold(k.Kty, "RSA") && k.Kid == kid {
+				return jwkToRSAPublicKey(k)
+			}
+		}
+	}
+	// Otherwise, pick the first RSA key
+	for _, k := range doc.Keys {
+		if strings.EqualFold(k.Kty, "RSA") {
+			return jwkToRSAPublicKey(k)
+		}
+	}
+	return nil, errors.New("no RSA key in jwks")
+}
+
+func jwkToRSAPublicKey(k jwkKey) (*rsa.PublicKey, error) {
+	if !strings.EqualFold(k.Kty, "RSA") {
+		return nil, fmt.Errorf("unsupported kty: %s", k.Kty)
+	}
+	nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+	if err != nil {
+		return nil, fmt.Errorf("invalid n: %w", err)
+	}
+	eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+	if err != nil {
+		return nil, fmt.Errorf("invalid e: %w", err)
+	}
+	// Convert eBytes (big-endian) to int
+	e := 0
+	for _, b := range eBytes {
+		e = (e << 8) | int(b)
+	}
+	if e <= 0 {
+		return nil, errors.New("invalid exponent")
+	}
+	n := new(big.Int).SetBytes(nBytes)
+	return &rsa.PublicKey{N: n, E: e}, nil
 }
