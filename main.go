@@ -317,6 +317,12 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 				if issuer == "" {
 					issuer = "http://" + announcedIP + ":" + strconv.Itoa(body.APIPort)
 				}
+				if strings.HasPrefix(issuer, "http://localhost:") {
+					issuer = "http://" + announcedIP + issuer[len("http://localhost:"):]
+				}
+				if strings.HasPrefix(issuer, "https://localhost:") {
+					issuer = "https://" + announcedIP + issuer[len("https://localhost:"):]
+				}
 				var kid string
 				if hv, ok := t.Header["kid"]; ok {
 					if s, ok := hv.(string); ok {
