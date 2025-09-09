@@ -28,14 +28,8 @@ type HeartbeatRequest struct {
 	ID             string `json:"id"`
 	Address        string `json:"address,omitempty"`
 	Port           int    `json:"port"`
-	ManagementPort int    `json:"managementPort,omitempty"`
 	Timestamp      int64  `json:"timestamp"`
 	Nonce          string `json:"nonce"`
-}
-
-type StatusResponse struct {
-	ID             string `json:"id"`
-	Type           string `json:"type"`
 	Name           string `json:"name,omitempty"`
 	CurrentPlayers int    `json:"currentPlayers,omitempty"`
 	MaxPlayers     int    `json:"maxPlayers,omitempty"`
@@ -128,12 +122,13 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		// If no address provided, infer it from the sender's remote address
-		if hb.Address == "" {
-			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
-				hb.Address = host
-			}
+		senderHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+		senderIP := net.ParseIP(senderHost)
+		if senderIP == nil {
+			http.Error(w, "could not determine sender IP", http.StatusBadRequest)
+			return
 		}
+		hb.Address = senderIP.String()
 		if hb.Port == 0 {
 			http.Error(w, "port is required", http.StatusBadRequest)
 			return
@@ -142,16 +137,12 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			http.Error(w, "address is required and could not be inferred", http.StatusBadRequest)
 			return
 		}
-		if hb.ManagementPort == 0 {
-			hb.ManagementPort = 8080
-		}
 		lookupID := hb.ID
 		if lookupID == "" {
 			lookupID = hb.Address + ":" + strconv.Itoa(hb.Port)
 		}
 
 		if existing := reg.Get(lookupID); existing != nil {
-			// If we already know this ID, reject the heartbeat if the address or port changed
 			if existing.Address != hb.Address || existing.Port != hb.Port {
 				http.Error(w, "address or port changed for existing ID", http.StatusBadRequest)
 				return
@@ -163,36 +154,22 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			return
 		}
 
-		client := &http.Client{Timeout: 3 * time.Second}
-		statusURL := "http://" + hb.Address + ":" + strconv.Itoa(hb.ManagementPort)
-		resp, err := client.Get(statusURL)
-		if err != nil {
-			http.Error(w, "failed to reach server status endpoint", http.StatusBadRequest)
+		if hb.CurrentPlayers < 0 || hb.MaxPlayers < 0 || hb.CurrentPlayers > hb.MaxPlayers {
+			http.Error(w, "invalid players data", http.StatusBadRequest)
 			return
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, "server status endpoint returned non-200", http.StatusBadRequest)
-			return
-		}
-		var st StatusResponse
-		dec2 := json.NewDecoder(resp.Body)
-		if err := dec2.Decode(&st); err != nil {
-			http.Error(w, "invalid status JSON: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		if st.Type != "selene" {
-			http.Error(w, "server type must be 'selene'", http.StatusBadRequest)
+		if len(hb.Name) > 200 {
+			http.Error(w, "name too long", http.StatusBadRequest)
 			return
 		}
 
 		s := ServerInfo{
 			ID:             hb.ID,
-			Name:           st.Name,
+			Name:           hb.Name,
 			Address:        hb.Address,
 			Port:           hb.Port,
-			CurrentPlayers: st.CurrentPlayers,
-			MaxPlayers:     st.MaxPlayers,
+			CurrentPlayers: hb.CurrentPlayers,
+			MaxPlayers:     hb.MaxPlayers,
 		}
 		reg.Upsert(s)
 		w.Header().Set("Content-Type", "application/json")
