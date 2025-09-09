@@ -10,8 +10,8 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"net/url"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -28,9 +28,31 @@ type ServerInfo struct {
 	Name           string    `json:"name"`
 	Address        string    `json:"address"`
 	Port           int       `json:"port"`
-	CurrentPlayers int       `json:"currentPlayers,omitempty"`
-	MaxPlayers     int       `json:"maxPlayers,omitempty"`
+	CurrentPlayers int       `json:"currentPlayers"`
+	MaxPlayers     int       `json:"maxPlayers"`
 	LastSeen       time.Time `json:"lastSeen"`
+	APIUrl         string    `json:"apiUrl"`
+}
+
+func computeRemoteUrl(pUrl string, clientIp string) (string, error) {
+	effective := strings.TrimSpace(pUrl)
+	if effective == "" {
+		return "", errors.New("apiUrl is required")
+	}
+	if strings.HasPrefix(effective, "http://localhost:") {
+		effective = "http://" + clientIp + effective[len("http://localhost:"):]
+	}
+	if strings.HasPrefix(effective, "https://localhost:") {
+		effective = "https://" + clientIp + effective[len("https://localhost:"):]
+	}
+	u, err := url.Parse(effective)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid apiUrl: %s", effective)
+	}
+	if isDisallowedHost(u.Hostname()) {
+		return "", errors.New("apiUrl cannot be a local/private address")
+	}
+	return effective, nil
 }
 
 type HeartbeatClaims struct {
@@ -41,7 +63,7 @@ type HeartbeatBody struct {
 	Name           string `json:"name,omitempty"`
 	Address        string `json:"address,omitempty"`
 	Port           int    `json:"port"`
-	APIPort        int    `json:"apiPort,omitempty"`
+	APIUrl         string `json:"apiUrl,omitempty"`
 	CurrentPlayers int    `json:"currentPlayers,omitempty"`
 	MaxPlayers     int    `json:"maxPlayers,omitempty"`
 }
@@ -309,9 +331,14 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 		}
 		body.Address = announcedIP
 
-		// Disallow local/private addresses for announcedIP
 		if isDisallowedHost(announcedIP) {
 			writeAPIError(w, http.StatusBadRequest, "local/private addresses are not allowed for address", nil)
+			return
+		}
+
+		announcedAPI, err := computeRemoteUrl(body.APIUrl, announcedIP)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
 
@@ -319,34 +346,20 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
-			if c, ok := t.Claims.(*HeartbeatClaims); ok {
-				issuer := c.RegisteredClaims.Issuer
-				if issuer == "" {
-					issuer = "http://" + announcedIP + ":" + strconv.Itoa(body.APIPort)
-				}
-				if strings.HasPrefix(issuer, "http://localhost:") {
-					issuer = "http://" + announcedIP + issuer[len("http://localhost:"):]
-				}
-				if strings.HasPrefix(issuer, "https://localhost:") {
-					issuer = "https://" + announcedIP + issuer[len("https://localhost:"):]
-				}
-				// Validate issuer is not local/private
-				u, err := url.Parse(issuer)
-				if err != nil || u.Host == "" {
-					return nil, fmt.Errorf("invalid issuer: %s", issuer)
-				}
-				if isDisallowedHost(u.Hostname()) {
-					return nil, errors.New("issuer cannot be a local/private address")
-				}
+			if _, ok := t.Claims.(*HeartbeatClaims); ok {
 				var kid string
 				if hv, ok := t.Header["kid"]; ok {
 					if s, ok := hv.(string); ok {
 						kid = s
 					}
 				}
+				issuer, err := t.Claims.GetIssuer()
+				if err != nil {
+					return nil, err
+				}
 				pk := getCachedPublicKey(issuer, kid)
 				if pk == nil {
-					pk, err := resolvePublicKey(issuer, kid)
+					pk, err := resolvePublicKey(issuer, kid, announcedAPI)
 					if err != nil {
 						return nil, err
 					}
@@ -389,6 +402,7 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			updated.Name = body.Name
 			updated.CurrentPlayers = body.CurrentPlayers
 			updated.MaxPlayers = body.MaxPlayers
+			updated.APIUrl = announcedAPI
 			reg.Upsert(updated)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -412,6 +426,7 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			Port:           body.Port,
 			CurrentPlayers: body.CurrentPlayers,
 			MaxPlayers:     body.MaxPlayers,
+			APIUrl:         announcedAPI,
 		}
 		reg.Upsert(s)
 		w.Header().Set("Content-Type", "application/json")
@@ -718,18 +733,18 @@ func isDisallowedIP(ip net.IP) bool {
 	return false
 }
 
-func resolvePublicKey(issuer, kid string) (*rsa.PublicKey, error) {
+func resolvePublicKey(issuer string, kid string, selfSignedFallback string) (*rsa.PublicKey, error) {
 	// TODO in the future, verified servers will provide a known registered issuer id under which we can lookup the stored public key instead of just trusting the announced ip
-	pk, err := fetchPublicKeyHTTP(issuer, kid)
+	pk, err := fetchPublicKeyHTTP(selfSignedFallback, kid)
 	if err != nil {
 		return nil, err
 	}
 	return pk, nil
 }
 
-func fetchPublicKeyHTTP(issuer string, kid string) (*rsa.PublicKey, error) {
+func fetchPublicKeyHTTP(baseUrl string, kid string) (*rsa.PublicKey, error) {
 	client := &http.Client{Timeout: 3 * time.Second}
-	jwksURL := fmt.Sprintf("%s/heartbeat/jwks", issuer)
+	jwksURL := fmt.Sprintf("%s/heartbeat/jwks", baseUrl)
 	if pk, err := fetchJWKS(client, jwksURL, kid); err == nil && pk != nil {
 		return pk, nil
 	}
