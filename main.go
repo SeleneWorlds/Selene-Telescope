@@ -359,11 +359,14 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 				}
 				pk := getCachedPublicKey(issuer, kid)
 				if pk == nil {
-					pk, err := resolvePublicKey(issuer, kid, announcedAPI)
+					pk, err = resolvePublicKey(issuer, kid, announcedAPI)
 					if err != nil {
 						return nil, err
 					}
 					setCachedPublicKey(issuer, kid, pk)
+				}
+				if pk == nil {
+					return nil, errors.New("no public key available for token verification")
 				}
 				return pk, nil
 			}
