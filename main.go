@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -319,36 +320,14 @@ func loadTrustedProxies() {
 }
 
 func splitAndTrim(s string, sep rune) []string {
-	var out []string
-	field := ""
-	for _, r := range s {
-		if r == sep {
-			if t := trimSpace(field); t != "" {
-				out = append(out, t)
-			} else {
-				out = append(out, t)
-			}
-			field = ""
-		} else {
-			field += string(r)
+	parts := strings.Split(s, string(sep))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if tp := strings.TrimSpace(p); tp != "" {
+			out = append(out, tp)
 		}
 	}
-	if t := trimSpace(field); t != "" {
-		out = append(out, t)
-	}
 	return out
-}
-
-func trimSpace(s string) string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	end := len(s)
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
 }
 
 func remoteIP(r *http.Request) net.IP {
@@ -390,28 +369,16 @@ var proxyHeaderOnce sync.Once
 
 func getProxyHeader() string {
 	proxyHeaderOnce.Do(func() {
-		v := trimSpace(os.Getenv("PROXY_HEADERS"))
-		switch lower(v) {
+		v := strings.TrimSpace(os.Getenv("PROXY_HEADERS"))
+		switch strings.ToLower(v) {
 		case "", "cloudflare", "xforwarded":
-			proxyHeader = lower(v)
+			proxyHeader = strings.ToLower(v)
 		default:
 			log.Printf("invalid PROXY_HEADERS=%q; allowed: cloudflare, xforwarded. Ignoring.", v)
 			proxyHeader = ""
 		}
 	})
 	return proxyHeader
-}
-
-func lower(s string) string {
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c = c + 32
-		}
-		b[i] = c
-	}
-	return string(b)
 }
 
 func clientIP(r *http.Request) net.IP {
@@ -423,7 +390,7 @@ func clientIP(r *http.Request) net.IP {
 		switch getProxyHeader() {
 		case "cloudflare":
 			if v := r.Header.Get("CF-Connecting-IP"); v != "" {
-				if ip := net.ParseIP(trimSpace(v)); ip != nil {
+				if ip := net.ParseIP(strings.TrimSpace(v)); ip != nil {
 					return ip
 				}
 			}
