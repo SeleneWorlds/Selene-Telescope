@@ -404,6 +404,12 @@ func clientIP(r *http.Request) net.IP {
 	}
 	// Only consider headers if we trust the remote as a proxy
 	if isTrustedProxy(rip) {
+		// For CloudFlare:
+		if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
+			if ip := net.ParseIP(trimSpace(cfip)); ip != nil {
+				return ip
+			}
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if ip := parseFirstIP(xff); ip != nil {
 				return ip
@@ -411,12 +417,6 @@ func clientIP(r *http.Request) net.IP {
 		}
 		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
 			if ip := net.ParseIP(trimSpace(xrip)); ip != nil {
-				return ip
-			}
-		}
-		// For CloudFlare:
-		if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
-			if ip := net.ParseIP(trimSpace(cfip)); ip != nil {
 				return ip
 			}
 		}
