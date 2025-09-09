@@ -283,24 +283,12 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func trustProxyEnabled() bool {
-	v := os.Getenv("TRUST_PROXY")
-	if v == "" {
-		return false
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false
-	}
-	return b
-}
-
 var trustedProxyNets []net.IPNet
 var trustedOnce sync.Once
 
 func loadTrustedProxies() {
 	trustedOnce.Do(func() {
-		list := os.Getenv("TRUSTED_PROXIES")
+		list := os.Getenv("PROXY_TRUSTED_ADDRESSES")
 		if list == "" {
 			trustedProxyNets = nil
 			return
@@ -324,7 +312,7 @@ func loadTrustedProxies() {
 				nets = append(nets, *n)
 				continue
 			}
-			log.Printf("ignoring invalid TRUSTED_PROXIES entry: %q", part)
+			log.Printf("ignoring invalid PROXY_TRUSTED_ADDRESSES entry: %q", part)
 		}
 		trustedProxyNets = nets
 	})
@@ -374,7 +362,7 @@ func remoteIP(r *http.Request) net.IP {
 func isTrustedProxy(ip net.IP) bool {
 	loadTrustedProxies()
 	if len(trustedProxyNets) == 0 {
-		return trustProxyEnabled()
+		return true
 	}
 	for _, n := range trustedProxyNets {
 		if n.Contains(ip) {
@@ -397,27 +385,53 @@ func parseFirstIP(list string) net.IP {
 	return nil
 }
 
+var proxyHeader string
+var proxyHeaderOnce sync.Once
+
+func getProxyHeader() string {
+	proxyHeaderOnce.Do(func() {
+		v := trimSpace(os.Getenv("PROXY_HEADERS"))
+		switch lower(v) {
+		case "", "cloudflare", "xforwarded":
+			proxyHeader = lower(v)
+		default:
+			log.Printf("invalid PROXY_HEADERS=%q; allowed: cloudflare, xforwarded. Ignoring.", v)
+			proxyHeader = ""
+		}
+	})
+	return proxyHeader
+}
+
+func lower(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c = c + 32
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
 func clientIP(r *http.Request) net.IP {
 	rip := remoteIP(r)
 	if rip == nil {
 		return nil
 	}
-	// Only consider headers if we trust the remote as a proxy
 	if isTrustedProxy(rip) {
-		// For CloudFlare:
-		if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
-			if ip := net.ParseIP(trimSpace(cfip)); ip != nil {
-				return ip
+		switch getProxyHeader() {
+		case "cloudflare":
+			if v := r.Header.Get("CF-Connecting-IP"); v != "" {
+				if ip := net.ParseIP(trimSpace(v)); ip != nil {
+					return ip
+				}
 			}
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if ip := parseFirstIP(xff); ip != nil {
-				return ip
-			}
-		}
-		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-			if ip := net.ParseIP(trimSpace(xrip)); ip != nil {
-				return ip
+		case "xforwarded":
+			if v := r.Header.Get("X-Forwarded-For"); v != "" {
+				if ip := parseFirstIP(v); ip != nil {
+					return ip
+				}
 			}
 		}
 	}
