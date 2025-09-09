@@ -10,6 +10,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/url"
 	"net/http"
 	"os"
 	"os/signal"
@@ -308,6 +309,12 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 		}
 		body.Address = announcedIP
 
+		// Disallow local/private addresses for announcedIP
+		if isDisallowedHost(announcedIP) {
+			writeAPIError(w, http.StatusBadRequest, "local/private addresses are not allowed for address", nil)
+			return
+		}
+
 		keyFunc := func(t *jwt.Token) (any, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
@@ -322,6 +329,14 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 				}
 				if strings.HasPrefix(issuer, "https://localhost:") {
 					issuer = "https://" + announcedIP + issuer[len("https://localhost:"):]
+				}
+				// Validate issuer is not local/private
+				u, err := url.Parse(issuer)
+				if err != nil || u.Host == "" {
+					return nil, fmt.Errorf("invalid issuer: %s", issuer)
+				}
+				if isDisallowedHost(u.Hostname()) {
+					return nil, errors.New("issuer cannot be a local/private address")
 				}
 				var kid string
 				if hv, ok := t.Header["kid"]; ok {
@@ -630,6 +645,77 @@ func clientIP(r *http.Request) net.IP {
 		}
 	}
 	return rip
+}
+
+// isDisallowedHost returns true if the provided host (hostname or IP string)
+// represents a local, private, or link-local address which should not be
+// allowed for announcedIP or issuer.
+func isDisallowedHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	// Fast-path for common hostnames
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	// If it's an IP, apply IP-based rules
+	if ip := net.ParseIP(host); ip != nil {
+		return isDisallowedIP(ip)
+	}
+	// For other hostnames we currently allow (no DNS resolution here).
+	return false
+}
+
+func isDisallowedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	// Loopback
+	if ip.IsLoopback() {
+		return true
+	}
+	// IPv4 checks
+	if v4 := ip.To4(); v4 != nil {
+		// 10.0.0.0/8
+		if v4[0] == 10 {
+			return true
+		}
+		// 172.16.0.0/12 -> 172.16.0.0 to 172.31.255.255
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return true
+		}
+		// 192.168.0.0/16
+		if v4[0] == 192 && v4[1] == 168 {
+			return true
+		}
+		// 127.0.0.0/8 already covered by IsLoopback, but keep for clarity
+		if v4[0] == 127 {
+			return true
+		}
+		// 169.254.0.0/16 link-local
+		if v4[0] == 169 && v4[1] == 254 {
+			return true
+		}
+		// 100.64.0.0/10 (CGNAT) - treat as non-public
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return true
+		}
+		return false
+	}
+	// IPv6 checks
+	// ::1 loopback
+	if ip.IsLoopback() {
+		return true
+	}
+	// fc00::/7 unique local addresses
+	if ip[0]&0xfe == 0xfc {
+		return true
+	}
+	// fe80::/10 link-local unicast
+	if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+		return true
+	}
+	return false
 }
 
 func resolvePublicKey(issuer, kid string) (*rsa.PublicKey, error) {
