@@ -120,6 +120,148 @@ func (r *Registry) PruneExpired() int {
 	return removed
 }
 
+func writeAPIError(w http.ResponseWriter, code int, msg string, err error) {
+	if err != nil {
+		log.Printf("API error: %s: %v", msg, err)
+	} else {
+		log.Printf("API error: %s", msg)
+	}
+	http.Error(w, msg, code)
+}
+
+type tokenBucket struct {
+	capacity   float64
+	tokens     float64
+	refillRate float64
+	last       time.Time
+}
+
+func (b *tokenBucket) allow(now time.Time, cost float64) bool {
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens = minFloat(b.capacity, b.tokens+elapsed*b.refillRate)
+		b.last = now
+	}
+	if b.tokens >= cost {
+		b.tokens -= cost
+		return true
+	}
+	return false
+}
+
+type IPRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*tokenBucket
+	rate    float64
+	burst   float64
+}
+
+func NewIPRateLimiter(rate float64, burst int) *IPRateLimiter {
+	if rate <= 0 {
+		rate = 5
+	}
+	if burst <= 0 {
+		burst = 10
+	}
+	return &IPRateLimiter{
+		buckets: make(map[string]*tokenBucket),
+		rate:    rate,
+		burst:   float64(burst),
+	}
+}
+
+func (l *IPRateLimiter) Allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	b, ok := l.buckets[key]
+	if !ok {
+		b = &tokenBucket{capacity: l.burst, tokens: l.burst, refillRate: l.rate, last: now}
+		l.buckets[key] = b
+	}
+	allowed := b.allow(now, 1)
+	l.mu.Unlock()
+	return allowed
+}
+
+var limiterOnce sync.Once
+var hbLimiter *IPRateLimiter
+
+func getHeartbeatLimiter() *IPRateLimiter {
+	limiterOnce.Do(func() {
+		// Configure via env: HEARTBEAT_RPS (float), HEARTBEAT_BURST (int)
+		// Defaults target ~1 heartbeat every 30s with small burst.
+		rate := 1.0 / 30.0
+		if v := os.Getenv("HEARTBEAT_RPS"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				rate = f
+			}
+		}
+		burst := 2
+		if v := os.Getenv("HEARTBEAT_BURST"); v != "" {
+			if i, err := strconv.Atoi(v); err == nil && i > 0 {
+				burst = i
+			}
+		}
+		hbLimiter = NewIPRateLimiter(rate, burst)
+		log.Printf("heartbeat rate limiter: rate=%.2f rps burst=%d", rate, burst)
+	})
+	return hbLimiter
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+type cachedKey struct {
+	key *rsa.PublicKey
+	exp time.Time
+}
+
+var jwksCache struct {
+	mu   sync.Mutex
+	m    map[string]cachedKey
+	ttl  time.Duration
+	once sync.Once
+}
+
+func jwksCacheInit() {
+	jwksCache.once.Do(func() {
+		jwksCache.m = make(map[string]cachedKey)
+		jwksCache.ttl = getenvDuration("JWKS_CACHE_TTL", 5*time.Minute)
+		log.Printf("jwks cache ttl=%s", jwksCache.ttl)
+	})
+}
+
+func cacheKey(issuer, kid string) string { return issuer + "|" + kid }
+
+func getCachedPublicKey(issuer, kid string) *rsa.PublicKey {
+	if issuer == "" || kid == "" {
+		return nil
+	}
+	jwksCacheInit()
+	jwksCache.mu.Lock()
+	ck, ok := jwksCache.m[cacheKey(issuer, kid)]
+	if ok && time.Now().Before(ck.exp) {
+		jwksCache.mu.Unlock()
+		return ck.key
+	}
+	jwksCache.mu.Unlock()
+	return nil
+}
+
+func setCachedPublicKey(issuer, kid string, key *rsa.PublicKey) {
+	if issuer == "" || kid == "" || key == nil {
+		return
+	}
+	jwksCacheInit()
+	jwksCache.mu.Lock()
+	jwksCache.m[cacheKey(issuer, kid)] = cachedKey{key: key, exp: time.Now().Add(jwksCache.ttl)}
+	jwksCache.mu.Unlock()
+}
+
 func heartbeatHandler(reg *Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -127,15 +269,24 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
+
 		var body HeartbeatBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid JSON", err)
 			return
 		}
 
 		senderIP := clientIP(r)
 		if senderIP == nil {
-			http.Error(w, "could not determine sender IP", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "could not determine sender IP", nil)
+			return
+		}
+
+		if !getHeartbeatLimiter().Allow(senderIP.String()) {
+			// Hint clients when to retry; default aligns with expected heartbeat period
+			w.Header().Set("Retry-After", "30")
+			writeAPIError(w, http.StatusTooManyRequests, "rate limit exceeded", nil)
 			return
 		}
 
@@ -147,7 +298,7 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			}
 		}
 		if tokenString == "" {
-			http.Error(w, "missing JWT bearer token", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "missing authentication", nil)
 			return
 		}
 
@@ -156,27 +307,29 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			announcedIP = senderIP.String()
 		}
 		body.Address = announcedIP
+
 		keyFunc := func(t *jwt.Token) (any, error) {
-			// Restrict algorithms to RSA variants
 			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
-			// Extract claims (unverified at this stage)
 			if c, ok := t.Claims.(*HeartbeatClaims); ok {
 				issuer := c.RegisteredClaims.Issuer
 				if issuer == "" {
 					issuer = "http://" + announcedIP + ":" + strconv.Itoa(body.APIPort)
 				}
-				// Resolve public key using issuer and the kid from the JWT
 				var kid string
 				if hv, ok := t.Header["kid"]; ok {
 					if s, ok := hv.(string); ok {
 						kid = s
 					}
 				}
-				pk, err := resolvePublicKey(issuer, kid)
-				if err != nil {
-					return nil, err
+				pk := getCachedPublicKey(issuer, kid)
+				if pk == nil {
+					pk, err := resolvePublicKey(issuer, kid)
+					if err != nil {
+						return nil, err
+					}
+					setCachedPublicKey(issuer, kid, pk)
 				}
 				return pk, nil
 			}
@@ -185,32 +338,37 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 
 		token, err := jwt.ParseWithClaims(tokenString, &HeartbeatClaims{}, keyFunc, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512"}))
 		if err != nil || !token.Valid {
-			http.Error(w, "invalid token: "+err.Error(), http.StatusUnauthorized)
+			writeAPIError(w, http.StatusUnauthorized, "invalid token", err)
 			return
 		}
 		claims, ok := token.Claims.(*HeartbeatClaims)
 		if !ok {
-			http.Error(w, "invalid claims", http.StatusUnauthorized)
+			writeAPIError(w, http.StatusUnauthorized, "invalid claims", nil)
 			return
 		}
 
 		if body.Port == 0 {
-			http.Error(w, "port is required", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "port is required", nil)
 			return
 		}
 		serverId := claims.RegisteredClaims.Subject
 		if serverId == "" {
-			http.Error(w, "subject is required", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "subject is required", nil)
 			return
 		}
 
 		if existing := reg.Get(serverId); existing != nil {
 			if existing.Address != body.Address || existing.Port != body.Port {
 				// TODO for verified servers, this will be allowed
-				http.Error(w, "address or port changed for existing ID", http.StatusBadRequest)
+				writeAPIError(w, http.StatusBadRequest, "address or port changed for existing ID", nil)
 				return
 			}
-			reg.Touch(serverId)
+			// Update metadata on heartbeat
+			updated := *existing
+			updated.Name = body.Name
+			updated.CurrentPlayers = body.CurrentPlayers
+			updated.MaxPlayers = body.MaxPlayers
+			reg.Upsert(updated)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -218,11 +376,11 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 		}
 
 		if body.CurrentPlayers < 0 || body.MaxPlayers < 0 {
-			http.Error(w, "invalid players data", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid players data", nil)
 			return
 		}
 		if len(body.Name) > 200 {
-			http.Error(w, "name too long", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid name", nil)
 			return
 		}
 
