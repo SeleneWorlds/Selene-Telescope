@@ -122,8 +122,7 @@ func heartbeatHandler(reg *Registry) http.HandlerFunc {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		senderHost, _, _ := net.SplitHostPort(r.RemoteAddr)
-		senderIP := net.ParseIP(senderHost)
+		senderIP := clientIP(r)
 		if senderIP == nil {
 			http.Error(w, "could not determine sender IP", http.StatusBadRequest)
 			return
@@ -274,6 +273,153 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+		cip := clientIP(r)
+		ripHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if cip != nil {
+			log.Printf("%s %s from=%s (remote=%s) %s", r.Method, r.URL.Path, cip.String(), ripHost, time.Since(start))
+		} else {
+			log.Printf("%s %s remote=%s %s", r.Method, r.URL.Path, ripHost, time.Since(start))
+		}
 	})
+}
+
+func trustProxyEnabled() bool {
+	v := os.Getenv("TRUST_PROXY")
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+var trustedProxyNets []net.IPNet
+var trustedOnce sync.Once
+
+func loadTrustedProxies() {
+	trustedOnce.Do(func() {
+		list := os.Getenv("TRUSTED_PROXIES")
+		if list == "" {
+			trustedProxyNets = nil
+			return
+		}
+		var nets []net.IPNet
+		for _, part := range splitAndTrim(list, ',') {
+			if part == "" {
+				continue
+			}
+			if ip := net.ParseIP(part); ip != nil {
+				// Convert single IP to /32 or /128 net
+				bits := 32
+				if ip.To4() == nil {
+					bits = 128
+				}
+				mask := net.CIDRMask(bits, bits)
+				nets = append(nets, net.IPNet{IP: ip.Mask(mask), Mask: mask})
+				continue
+			}
+			if _, n, err := net.ParseCIDR(part); err == nil {
+				nets = append(nets, *n)
+				continue
+			}
+			log.Printf("ignoring invalid TRUSTED_PROXIES entry: %q", part)
+		}
+		trustedProxyNets = nets
+	})
+}
+
+func splitAndTrim(s string, sep rune) []string {
+	var out []string
+	field := ""
+	for _, r := range s {
+		if r == sep {
+			if t := trimSpace(field); t != "" {
+				out = append(out, t)
+			} else {
+				out = append(out, t)
+			}
+			field = ""
+		} else {
+			field += string(r)
+		}
+	}
+	if t := trimSpace(field); t != "" {
+		out = append(out, t)
+	}
+	return out
+}
+
+func trimSpace(s string) string {
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func remoteIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return net.ParseIP(r.RemoteAddr)
+	}
+	return net.ParseIP(host)
+}
+
+func isTrustedProxy(ip net.IP) bool {
+	loadTrustedProxies()
+	if len(trustedProxyNets) == 0 {
+		return trustProxyEnabled()
+	}
+	for _, n := range trustedProxyNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseFirstIP(list string) net.IP {
+	// X-Forwarded-For: client, proxy1, proxy2 ... (left-most is original client)
+	for _, p := range splitAndTrim(list, ',') {
+		if p == "" {
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			return ip
+		}
+	}
+	return nil
+}
+
+func clientIP(r *http.Request) net.IP {
+	rip := remoteIP(r)
+	if rip == nil {
+		return nil
+	}
+	// Only consider headers if we trust the remote as a proxy
+	if isTrustedProxy(rip) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if ip := parseFirstIP(xff); ip != nil {
+				return ip
+			}
+		}
+		if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+			if ip := net.ParseIP(trimSpace(xrip)); ip != nil {
+				return ip
+			}
+		}
+		// For CloudFlare:
+		if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
+			if ip := net.ParseIP(trimSpace(cfip)); ip != nil {
+				return ip
+			}
+		}
+	}
+	return rip
 }
